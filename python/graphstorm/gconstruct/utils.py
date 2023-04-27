@@ -27,6 +27,7 @@ import dgl
 import torch as th
 
 from ..utils import sys_tracker
+from .file_io import HDF5Array
 
 def worker_fn(task_queue, res_queue, user_parser):
     """ The worker function in the worker pool
@@ -51,10 +52,9 @@ def worker_fn(task_queue, res_queue, user_parser):
     except queue.Empty:
         pass
 
-class WorkerPool:
-    """ A worker process pool
+def multiprocessing_data_read(in_files, num_processes, user_parser):
+    """ Read data from multiple files with multiprocessing.
 
-    This worker process pool is specialized to process node/edge data.
     It creates a set of worker processes, each of which runs a worker function.
     It first adds all tasks in a queue and each worker gets a task from the queue
     at a time until the workers process all tasks. It maintains a result queue
@@ -62,54 +62,106 @@ class WorkerPool:
     To ensure the order of the data, each data file is associated with
     a number and the processed data are ordered by that number.
 
+    If there are only one input file, it reads the data from the input file in the main process.
+
     Parameters
     ----------
-    name : str or tuple of str
-        The name of the worker pool.
     in_files : list of str
         The input data files.
     num_processes : int
         The number of processes that run in parallel.
     user_parser : callable
         The user-defined function to read and process the data files.
+
+    Returns
+    -------
+    a dict : key is the file index, the value is processed data.
     """
-    def __init__(self, name, in_files, num_processes, user_parser):
-        self.name = name
-        self.processes = []
+    if num_processes > 0 and len(in_files) > 1:
+        processes = []
         manager = multiprocessing.Manager()
-        self.task_queue = manager.Queue()
-        self.res_queue = manager.Queue(8)
-        self.num_files = len(in_files)
+        task_queue = manager.Queue()
+        res_queue = manager.Queue(8)
+        num_files = len(in_files)
         for i, in_file in enumerate(in_files):
-            self.task_queue.put((i, in_file))
+            task_queue.put((i, in_file))
         for _ in range(num_processes):
-            proc = Process(target=worker_fn, args=(self.task_queue, self.res_queue, user_parser))
+            proc = Process(target=worker_fn, args=(task_queue, res_queue, user_parser))
             proc.start()
-            self.processes.append(proc)
+            processes.append(proc)
 
-    def get_data(self):
-        """ Get the processed data.
-
-        Returns
-        -------
-        a dict : key is the file index, the value is processed data.
-        """
         return_dict = {}
-        while len(return_dict) < self.num_files:
-            file_idx, vals= self.res_queue.get()
+        while len(return_dict) < num_files:
+            file_idx, vals= res_queue.get()
             return_dict[file_idx] = vals
-            sys_tracker.check(f'process {self.name} data file: {file_idx}')
+            sys_tracker.check(f'process data file: {file_idx}')
             gc.collect()
-        return return_dict
 
-    def close(self):
-        """ Stop the process pool.
-        """
-        for proc in self.processes:
+        for proc in processes:
             proc.join()
 
-class ExtMemArrayConverter:
-    """ Convert a Numpy array to an external-memory Numpy array.
+        return return_dict
+    else:
+        return_dict = {}
+        for i, in_file in enumerate(in_files):
+            return_dict[i] = user_parser(in_file)
+        return return_dict
+
+def _get_tot_shape(arrs):
+    """ Get the shape after merging the arrays.
+
+    Parameters
+    ----------
+    arrs : list of arrays
+
+    Returns
+    -------
+    tuple : the shape of the merged array.
+    """
+    num_rows = 0
+    shape1 = arrs[0].shape[1:]
+    for arr in arrs:
+        num_rows += arr.shape[0]
+        assert shape1 == arr.shape[1:]
+    shape = [num_rows] + list(shape1)
+    return tuple(shape)
+
+def _merge_arrs(arrs, tensor_path):
+    """ Merge the arrays.
+
+    The merged array may be stored in a file specified by the path.
+
+    Parameters
+    ----------
+    arrs : list of arrays.
+        The input arrays.
+    tensor_path : str
+        The path where the Numpy array is stored.
+
+    Returns
+    -------
+    Numpy array : the merged array.
+    """
+    assert isinstance(arrs, list)
+    shape = _get_tot_shape(arrs)
+    dtype = arrs[0].dtype
+    if tensor_path is not None:
+        out_arr = np.memmap(tensor_path, dtype, mode="w+", shape=shape)
+        row_idx = 0
+        for arr in arrs:
+            out_arr[row_idx:(row_idx + arr.shape[0])] = arr[:]
+            row_idx += arr.shape[0]
+        return out_arr
+    elif isinstance(arrs[0], HDF5Array):
+        arrs = [arr.to_numpy() for arr in arrs]
+        return np.concatenate(arrs)
+    else:
+        return np.concatenate(arrs)
+
+class ExtMemArrayMerger:
+    """ Merge multiple Numpy arrays.
+
+    The merged array may be stored on disks.
 
     Parameters
     ----------
@@ -127,32 +179,43 @@ class ExtMemArrayConverter:
         for tensor_file in self._tensor_files:
             os.remove(tensor_file)
 
-    def __call__(self, arr, name):
-        """ Convert a Numpy array.
+    def __call__(self, arrs, name):
+        """ Merge multiple Numpy array.
 
         Parameters
         ----------
-        arr : Numpy array
-            The input array.
+        arrs : list of arrays.
+            The input arrays.
         name : str
             The name of the external memory array.
 
         Returns
         -------
-        Numpy array : the Numpy array stored in external memory.
+        Numpy array : an array stored in external memory.
         """
+        assert isinstance(arrs, list)
+        shape = _get_tot_shape(arrs)
         # If external memory workspace is not initialized or the feature size is smaller
         # than a threshold, we don't do anything.
-        if self._ext_mem_workspace is None or np.prod(arr.shape[1:]) < self._ext_mem_feat_size:
-            return arr
+        if self._ext_mem_workspace is None or np.prod(shape[1:]) < self._ext_mem_feat_size:
+            if len(arrs) == 1 and isinstance(arrs[0], HDF5Array):
+                return arrs[0].to_numpy()
+            elif len(arrs) == 1:
+                return arrs[0]
+            else:
+                return _merge_arrs(arrs, None)
 
         # We need to create the workspace directory if it doesn't exist.
         os.makedirs(self._ext_mem_workspace, exist_ok=True)
         tensor_path = os.path.join(self._ext_mem_workspace, name + ".npy")
         self._tensor_files.append(tensor_path)
-        em_arr = np.memmap(tensor_path, arr.dtype, mode="w+", shape=arr.shape)
-        em_arr[:] = arr[:]
-        return em_arr
+        if len(arrs) > 1:
+            return _merge_arrs(arrs, tensor_path)
+        else:
+            arr = arrs[0]
+            em_arr = np.memmap(tensor_path, arr.dtype, mode="w+", shape=shape)
+            em_arr[:] = arr[:]
+            return em_arr
 
 def partition_graph(g, node_data, edge_data, graph_name, num_partitions, output_dir,
                     part_method=None):
