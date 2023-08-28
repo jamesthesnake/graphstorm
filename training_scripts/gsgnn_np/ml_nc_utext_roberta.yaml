@@ -3,9 +3,9 @@ version: 1.0
 lm_model:
   node_lm_models:
     -
-      lm_type: bert
-      model_name: "bert-base-uncased"
-      gradient_checkpoint: false
+      lm_type: roberta
+      model_name: "roberta-base"
+      gradient_checkpoint: true
       node_types:
         - movie
         - user
@@ -16,21 +16,16 @@ gsf:
     part_config: movielen_100k_utext_train_val_1p_4t/movie-lens-100k.json
     verbose: false
     save_perf_results_path: null
-  lmgnn:
+  lm:
     lm_train_nodes: 10
     lm_infer_batch_size: 32
     freeze_lm_encoder_epochs: 0
+  gnn:
     model_encoder_type: rgcn
     fanout: "4"
     num_layers: 1
     hidden_size: 128
-    use_mini_batch_infer: true    
-    training_method:
-      name: glem
-      kwargs:
-        em_order_gnn_first: false
-        inference_using_gnn: true
-        pl_weight: 0.5
+    use_mini_batch_infer: true
   input:
     restore_model_path: null
   output:
