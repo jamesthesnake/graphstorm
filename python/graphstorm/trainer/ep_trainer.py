@@ -29,6 +29,7 @@ from .gsgnn_trainer import GSgnnTrainer
 from ..utils import sys_tracker, rt_profiler
 from ..utils import barrier, is_distributed, get_backend
 
+
 class GSgnnEdgePredictionTrainer(GSgnnTrainer):
     """ Edge prediction trainer.
 

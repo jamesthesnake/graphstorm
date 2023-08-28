@@ -51,12 +51,6 @@ def get_backend():
     assert is_distributed(), "get_backend() is valid only when is_distributed() is True."
     return th.distributed.get_backend()
 
-def get_rank():
-    """ Get rank of a process
-    """
-    if is_distributed():
-        return th.distributed.get_rank()
-    return 0
 
 def get_world_size():
     """ Get the world size.
@@ -64,6 +58,22 @@ def get_world_size():
     if is_distributed():
         return th.distributed.get_world_size()
     return 1
+
+def barrier():
+    """ Run barrier among trainers.
+    """
+    if is_distributed():
+        th.distributed.barrier()
+    else:
+        return 0
+
+def get_world_size():
+    """ Get the world size.
+    """
+    if is_distributed():
+        return th.distributed.get_world_size()
+    else:
+        return 1
 
 def barrier():
     """ Run barrier among trainers.

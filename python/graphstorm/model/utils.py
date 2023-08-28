@@ -27,7 +27,7 @@ from torch.nn.parallel import DistributedDataParallel
 import dgl
 
 from ..utils import get_rank, barrier
-from ..data.utils import alltoallv_cpu
+from ..data.utils import alltoallv_nccl, alltoallv_cpu
 
 def sparse_emb_initializer(emb):
     """ Initialize sparse embedding
