@@ -180,6 +180,7 @@ fi
 
 rm /tmp/log.txt
 
+
 python3 $GS_HOME/tests/end2end-tests/check_infer.py --train_embout /data/gsgnn_lp_ml_dot/emb/ --infer_embout /data/gsgnn_lp_ml_dot/infer-emb/ --link_prediction
 
 error_and_exit $?

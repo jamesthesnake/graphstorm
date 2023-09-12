@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import abc
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 
 class LabelConfig(abc.ABC):
