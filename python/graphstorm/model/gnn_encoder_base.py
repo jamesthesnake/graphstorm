@@ -25,7 +25,7 @@ from torch import nn
 from dgl.distributed import DistTensor, node_split
 from .gs_layer import GSLayer
 
-from ..utils import get_rank, barrier
+from ..utils import get_rank, barrier, is_distributed
 
 class GraphConvEncoder(GSLayer):     # pylint: disable=abstract-method
     r"""General encoder for graph data.
@@ -79,7 +79,6 @@ class GraphConvEncoder(GSLayer):     # pylint: disable=abstract-method
     def dist_inference(self, g, get_input_embeds, batch_size, fanout,
                        edge_mask=None, task_tracker=None):
         """Distributed inference of final representation over all node types.
-
         Parameters
         ----------
         g : DistGraph
@@ -96,13 +95,115 @@ class GraphConvEncoder(GSLayer):     # pylint: disable=abstract-method
             The edge mask indicates which edges are used to compute GNN embeddings.
         task_tracker : GSTaskTrackerAbc
             The task tracker.
-
         Returns
         -------
         dict of Tensor : the final GNN embeddings of all nodes.
         """
         return dist_inference(g, self, get_input_embeds, batch_size, fanout,
-                              edge_mask=edge_mask, task_tracker=task_tracker)
+                            edge_mask=edge_mask, task_tracker=task_tracker)
+
+def dist_minibatch_inference(g, gnn_encoder, get_input_embeds, batch_size, fanout,
+                             edge_mask=None, target_ntypes=None, task_tracker=None):
+    """Distributed inference of final representation over all node types
+       using mini-batch inference.
+
+    Parameters
+    ----------
+    g : DistGraph
+        The distributed graph.
+    gnn_encoder : GraphConvEncoder
+        The GNN encoder on the graph.
+    get_input_embeds : func
+        A function used ot get input embeddings.
+    batch_size : int
+        The batch size for the GNN inference.
+    fanout : list of int
+        The fanout for computing the GNN embeddings in a GNN layer.
+    edge_mask : str
+        The edge mask indicates which edges are used to compute GNN embeddings.
+        task_tracker : GSTaskTrackerAbc
+        The task tracker.
+    target_ntypes: list of str
+        Node types that need to compute node embeddings.
+    task_tracker: GSTaskTrackerAbc
+        Task tracker
+
+    Returns
+    -------
+    dict of Tensor : the final GNN embeddings of all nodes.
+    """
+    device = gnn_encoder.device
+    fanout = [-1] * gnn_encoder.num_layers \
+        if fanout is None or len(fanout) == 0 else fanout
+    target_ntypes = g.ntypes if target_ntypes is None else target_ntypes
+    with th.no_grad():
+        infer_nodes = {}
+        out_embs = {}
+        for ntype in target_ntypes:
+            h_dim = gnn_encoder.out_dims
+            # Create dist tensor to store the output embeddings
+            out_embs[ntype] = DistTensor((g.number_of_nodes(ntype), h_dim),
+                                         dtype=th.float32, name='h-last',
+                                         part_policy=g.get_node_partition_policy (ntype),
+                                         # TODO(zhengda) this makes the tensor persistent in memory.
+                                         persistent=True)
+            infer_nodes[ntype] = node_split(th.ones((g.number_of_nodes(ntype),),
+                                                        dtype=th.bool),
+                                                partition_book=g.get_partition_book(),
+                                                ntype=ntype, force_even=False)
+
+        sampler = dgl.dataloading.MultiLayerNeighborSampler(fanout, mask=edge_mask)
+        dataloader = dgl.dataloading.DistNodeDataLoader(g, infer_nodes, sampler,
+                                                            batch_size=batch_size,
+                                                            shuffle=False,
+                                                            drop_last=False)
+
+        len_dataloader = max_num_batch = len(list(dataloader))
+        tensor = th.tensor([len_dataloader], device=device)
+        if is_distributed():
+            th.distributed.all_reduce(tensor, op=th.distributed.ReduceOp.MAX)
+            max_num_batch = tensor[0]
+        dataloader_iter = iter(dataloader)
+
+        # WholeGraph does not support imbalanced batch numbers across processes/trainers
+        # TODO (IN): Fix dataloader to have same number of minibatches.
+        for iter_l in range(max_num_batch):
+            tmp_keys = []
+            if iter_l < len_dataloader:
+                input_nodes, output_nodes, blocks = next(dataloader_iter)
+                if not isinstance(input_nodes, dict):
+                    # This happens on a homogeneous graph.
+                    assert len(g.ntypes) == 1
+                    input_nodes = {g.ntypes[0]: input_nodes}
+                if not isinstance(output_nodes, dict):
+                    # This happens on a homogeneous graph.
+                    assert len(g.ntypes) == 1
+                    output_nodes = {g.ntypes[0]: output_nodes}
+                tmp_keys = [ntype for ntype in g.ntypes if ntype not in input_nodes]
+                # All samples should contain all the ntypes for wholegraph compatibility
+                input_nodes.update({ntype: th.empty((0,), dtype=g.idtype) \
+                    for ntype in tmp_keys})
+            else:
+                input_nodes = {ntype: th.empty((0,), dtype=g.idtype) for ntype in g.ntypes}
+                blocks = None
+            if iter_l % 100000 == 0 and get_rank() == 0:
+                logging.info("[Rank 0] dist inference: " \
+                        "finishes %d iterations.", iter_l)
+            if task_tracker is not None:
+                task_tracker.keep_alive(report_step=iter_l)
+
+            h = get_input_embeds(input_nodes)
+            if blocks is None:
+                continue
+            for ntype in tmp_keys:
+                del input_nodes[ntype]
+            blocks = [block.to(device) for block in blocks]
+            output = gnn_encoder(blocks, h)
+
+            for ntype, out_nodes in output_nodes.items():
+                out_embs[ntype][out_nodes] = output[ntype].cpu()
+        barrier()
+    return out_embs
 
 def dist_inference_one_layer(layer_id, g, dataloader, target_ntypes, layer, get_input_embeds,
                              device, task_tracker):
@@ -129,27 +230,57 @@ def dist_inference_one_layer(layer_id, g, dataloader, target_ntypes, layer, get_
 
     Returns
     -------
-    dict of Tensors : the inferenced tensors.
+        dict of Tensors : the inferenced tensors.
     """
+    len_dataloader = max_num_batch = len(list(dataloader))
+    tensor = th.tensor([len_dataloader], device=device)
+    if is_distributed():
+        th.distributed.all_reduce(tensor, op=th.distributed.ReduceOp.MAX)
+        max_num_batch = tensor[0]
+
+    dataloader_iter = iter(dataloader)
     y = {}
-    for iter_l, (input_nodes, output_nodes, blocks) in enumerate(dataloader):
+
+    # WholeGraph does not support imbalanced batch numbers across processes/trainers
+    # TODO (IN): Fix dataloader to have same number of minibatches.
+    for iter_l in range(max_num_batch):
+        tmp_keys = []
+        if iter_l < len_dataloader:
+            input_nodes, output_nodes, blocks = next(dataloader_iter)
+            if not isinstance(input_nodes, dict):
+                # This happens on a homogeneous graph.
+                assert len(g.ntypes) == 1
+                input_nodes = {g.ntypes[0]: input_nodes}
+            if not isinstance(output_nodes, dict):
+                # This happens on a homogeneous graph.
+                assert len(g.ntypes) == 1
+                output_nodes = {g.ntypes[0]: output_nodes}
+            if layer_id == "0":
+                tmp_keys = [ntype for ntype in g.ntypes if ntype not in input_nodes]
+                # All samples should contain all the ntypes for wholegraph compatibility
+                input_nodes.update({ntype: th.empty((0,), dtype=g.idtype) \
+                    for ntype in tmp_keys})
+        else:
+            # Embeddings when layer_id > 0 depend on the output of layer 0, not on
+            # node features anymore. Hence, we don't need to create dummy tensors for
+            # wholegraph compatibility. Also, ntypes of input nodes might conflict with
+            # the ntypes of ouput nodes.
+            if int(layer_id) > 0:
+                continue
+            input_nodes = {ntype: th.empty((0,), dtype=g.idtype) for ntype in g.ntypes}
+            blocks = None
         if iter_l % 100000 == 0 and get_rank() == 0:
             logging.info("[Rank 0] dist_inference: finishes %d iterations.", iter_l)
 
         if task_tracker is not None:
             task_tracker.keep_alive(report_step=iter_l)
-        block = blocks[0].to(device)
-        if not isinstance(input_nodes, dict):
-            # This happens on a homogeneous graph.
-            assert len(g.ntypes) == 1
-            input_nodes = {g.ntypes[0]: input_nodes}
-
-        if not isinstance(output_nodes, dict):
-            # This happens on a homogeneous graph.
-            assert len(g.ntypes) == 1
-            output_nodes = {g.ntypes[0]: output_nodes}
 
         h = get_input_embeds(input_nodes)
+        if blocks is None:
+            continue
+        for ntype in tmp_keys:
+            del input_nodes[ntype]
+        block = blocks[0].to(device)
         h = layer(block, h)
 
         # For the first iteration, we need to create output tensors.
@@ -183,7 +314,8 @@ def dist_inference_one_layer(layer_id, g, dataloader, target_ntypes, layer, get_
 
 def dist_inference(g, gnn_encoder, get_input_embeds, batch_size, fanout,
                    edge_mask=None, task_tracker=None):
-    """Distributed inference of final representation over all node types.
+    """Distributed inference of final representation over all node types
+       using layer-by-layer inference.
 
     Parameters
     ----------
