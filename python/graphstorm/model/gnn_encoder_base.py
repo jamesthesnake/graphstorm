@@ -191,6 +191,164 @@ def dist_inference(g, gnn_encoder, get_input_embeds, batch_size, fanout,
         The distributed graph.
     gnn_encoder : GraphConvEncoder
         The GNN encoder on the graph.
+    get_input_embeds : func
+        A function used ot get input embeddings.
+    batch_size : int
+        The batch size for the GNN inference.
+    fanout : list of int
+        The fanout for computing the GNN embeddings in a GNN layer.
+    edge_mask : str
+        The edge mask indicates which edges are used to compute GNN embeddings.
+        task_tracker : GSTaskTrackerAbc
+        The task tracker.
+    target_ntypes: list of str
+        Node types that need to compute node embeddings.
+    task_tracker: GSTaskTrackerAbc
+        Task tracker
+
+    Returns
+    -------
+    dict of Tensor : the final GNN embeddings of all nodes.
+    """
+    device = gnn_encoder.device
+    fanout = [-1] * gnn_encoder.num_layers \
+        if fanout is None or len(fanout) == 0 else fanout
+    target_ntypes = g.ntypes if target_ntypes is None else target_ntypes
+    with th.no_grad():
+        infer_nodes = {}
+        out_embs = {}
+        for ntype in target_ntypes:
+            h_dim = gnn_encoder.out_dims
+            # Create dist tensor to store the output embeddings
+            out_embs[ntype] = DistTensor((g.number_of_nodes(ntype), h_dim),
+                                         dtype=th.float32, name='h-last',
+                                         part_policy=g.get_node_partition_policy (ntype),
+                                         # TODO(zhengda) this makes the tensor persistent in memory.
+                                         persistent=True)
+            infer_nodes[ntype] = node_split(th.ones((g.number_of_nodes(ntype),),
+                                                        dtype=th.bool),
+                                                partition_book=g.get_partition_book(),
+                                                ntype=ntype, force_even=False)
+
+        sampler = dgl.dataloading.MultiLayerNeighborSampler(fanout, mask=edge_mask)
+        dataloader = dgl.dataloading.DistNodeDataLoader(g, infer_nodes, sampler,
+                                                            batch_size=batch_size,
+                                                            shuffle=False,
+                                                            drop_last=False)
+
+        for iter_l, (input_nodes, output_nodes, blocks) in enumerate(dataloader):
+            if iter_l % 100000 == 0 and get_rank() == 0:
+                logging.info("[Rank 0] dist inference: " \
+                        "finishes %d iterations.", iter_l)
+            if task_tracker is not None:
+                task_tracker.keep_alive(report_step=iter_l)
+
+            blocks = [block.to(device) for block in blocks]
+            if not isinstance(input_nodes, dict):
+                # This happens on a homogeneous graph.
+                assert len(g.ntypes) == 1
+                input_nodes = {g.ntypes[0]: input_nodes}
+
+            if not isinstance(output_nodes, dict):
+                # This happens on a homogeneous graph.
+                assert len(g.ntypes) == 1
+                output_nodes = {g.ntypes[0]: output_nodes}
+            h = get_input_embeds(input_nodes)
+            output = gnn_encoder(blocks, h)
+
+            for ntype, out_nodes in output_nodes.items():
+                out_embs[ntype][out_nodes] = output[ntype].cpu()
+        barrier()
+    return out_embs
+
+def dist_inference_one_layer(layer_id, g, dataloader, target_ntypes, layer, get_input_embeds,
+                             device, task_tracker):
+    """ Run distributed inference for one GNN layer.
+
+    Parameters
+    ----------
+    layer_id : str
+        The layer ID.
+    g : DistGraph
+        The full distributed graph.
+    target_ntypes : list of str
+        The node types where we compute GNN embeddings.
+    dataloader : Pytorch dataloader
+        The iterator over the nodes for computing GNN embeddings.
+    layer : nn module
+        A GNN layer
+    get_input_embeds : callable
+        Get the node features.
+    device : Pytorch device
+        The device to run mini-batch computation.
+    task_tracker : GSTaskTrackerAbc
+        The task tracker.
+
+    Returns
+    -------
+        dict of Tensors : the inferenced tensors.
+    """
+    y = {}
+    for iter_l, (input_nodes, output_nodes, blocks) in enumerate(dataloader):
+        if iter_l % 100000 == 0 and get_rank() == 0:
+            logging.info("[Rank 0] dist_inference: finishes %d iterations.", iter_l)
+
+        if task_tracker is not None:
+            task_tracker.keep_alive(report_step=iter_l)
+        block = blocks[0].to(device)
+        if not isinstance(input_nodes, dict):
+            # This happens on a homogeneous graph.
+            assert len(g.ntypes) == 1
+            input_nodes = {g.ntypes[0]: input_nodes}
+
+        if not isinstance(output_nodes, dict):
+            # This happens on a homogeneous graph.
+            assert len(g.ntypes) == 1
+            output_nodes = {g.ntypes[0]: output_nodes}
+
+        h = get_input_embeds(input_nodes)
+        h = layer(block, h)
+
+        # For the first iteration, we need to create output tensors.
+        if iter_l == 0:
+            # Infer the hidden dim size.
+            # Here we assume all node embeddings have the same dim size.
+            h_dim = 0
+            dtype = None
+            for k in h:
+                assert len(h[k].shape) == 2, \
+                        "The embedding tensors should have only two dimensions."
+                h_dim = h[k].shape[1]
+                dtype = h[k].dtype
+            assert h_dim > 0, "Cannot inference the hidden dim size."
+
+            # Create distributed tensors to store the embeddings.
+            for k in target_ntypes:
+                y[k] = DistTensor((g.number_of_nodes(k), h_dim),
+                                  dtype=dtype, name=f'h-{layer_id}',
+                                  part_policy=g.get_node_partition_policy(k),
+                                  # TODO(zhengda) this makes the tensor persistent in memory.
+                                  persistent=True)
+
+        for k in h.keys():
+            # some ntypes might be in the tensor h but are not in the output nodes
+            # that have empty tensors
+            if k in output_nodes:
+                assert k in y, "All mini-batch outputs should have the same tensor names."
+                y[k][output_nodes[k]] = h[k].cpu()
+    return y
+
+def dist_inference(g, gnn_encoder, get_input_embeds, batch_size, fanout,
+                   edge_mask=None, task_tracker=None):
+    """Distributed inference of final representation over all node types
+       using layer-by-layer inference.
+
+    Parameters
+    ----------
+    g : DistGraph
+        The distributed graph.
+    gnn_encoder : GraphConvEncoder
+        The GNN encoder on the graph.
     get_input_embeds : callable
         Get the node features.
     batch_size : int
