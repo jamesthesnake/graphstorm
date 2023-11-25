@@ -22,15 +22,49 @@ Prerequisite
     
     2. **EFA-enabled security group**: Please follow the `steps <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start-nccl-base.html#nccl-start-base-setup>`_ to prepare an EFA-enabled security group for Amazon EC2 instances.
     
-    3. **Docker**: You need to install Docker in your environment as the `Docker documentation <https://docs.docker.com/get-docker/>`_ suggests, and the `Nvidia Container Toolkit <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html>`_.
+    3. **NVIDIA-Docker**: You need to install NVIDIA Docker in your environment and the `Nvidia Container Toolkit <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html>`_.
 
-For example, in an Amazon EC2 instance without Docker preinstalled, you can run the following commands to install Docker.
+For example, in an Amazon EC2 instance without Docker preinstalled, you can run the following commands to install NVIDIA Docker.
 
 .. code:: bash
 
+    distribution=$(. /etc/os-release;echo $ID$VERSION_ID) \
+    && curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+    && curl -s -L https://nvidia.github.io/libnvidia-container/experimental/$distribution/libnvidia-container.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
     sudo apt-get update
-    sudo apt update
-    sudo apt install Docker.io
+    sudo apt-get install -y nvidia-docker2
+    sudo systemctl daemon-reload
+    sudo systemctl restart docker
+
+Launch instance with EFA support
+---------------------------------
+
+While launching the EFA supported EC2 instances, in the Network settings section, choose Edit, and then do the following:
+
+    1. For Subnet, choose the subnet in which to launch the instance. If you do not select a subnet, you can't enable the instance for EFA.
+
+    2. For Firewall (security groups), Choose `Select existing security group` and then pick the EFA-enabled security group you previously created as outlined in the prerequisites.
+
+    3. Expand the Advanced network configuration section, and for Elastic Fabric Adapter, select Enable.
+
+
+Install aws-efa-installer on the EC2 instance
+----------------------------------------------
+
+Install aws-efa-installer on both the base instance and within the Docker container. This enables the instance to use AWS's EFA kernel instead of Ubuntu's default kernel. Install the EFA installer without ``--skip-kmod`` on the instance and with ``--skip-kmod`` in the container. A command is provided for the base instance installation, and the Dockerfile will handle container installation in the next step.
+
+.. code:: bash
+
+    curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz \
+    && tar -xf aws-efa-installer-latest.tar.gz \
+    && cd aws-efa-installer \
+    && apt-get update \
+    && apt-get install -y libhwloc-dev \
+    && ./efa_installer.sh -y -g -d --skip-limit-conf --no-verify \
+    && rm -rf /var/lib/apt/lists/*
+
 
 Build a GraphStorm-WholeGraph Docker image from source
 --------------------------------------------------------
@@ -62,7 +96,7 @@ If the build succeeds, there should be a new Docker image, named `<docker-name>:
 Create a GraphStorm-WholeGraph container
 -----------------------------------------
 
-You can launch a container based on the Docker image built in the previous step. Make sure to use ``--privileged`` and ``—network=host`` map your host network to the container:
+You can launch a container based on the Docker image built in the previous step. Make sure to use ``--privileged`` and ``—-network=host`` map your host network to the container:
 
 .. code:: bash
 
@@ -86,6 +120,10 @@ If succeeds, the command prompt will change to the container's, like
 .. code:: bash
 
     root@<ip-address>:/#
+
+.. note::
+    
+    If you want to use the built Docker image in a distributed cluster, please make sure you follow the :ref:`Create a GraphStorm Cluster<create_cluster>` step and use the WholeGraph-supported Docker image in your cluster.
 
 Verify EFA and NCCL configuration
 -----------------------------------
@@ -134,13 +172,13 @@ The output should resemble with the following screenshot which includes `NCCL IN
 Convert node features to a WholeGraph-compatible format
 ---------------------------------------------------------
 
-Different from typical GraphStorm training where node features are stored in the ``node_feat.dgl`` in each partition, to utilize WholeGraph, the node features must be converted into a compatible WholeGraph format. After construct your raw data into GraphStorm required DistDGL format following this :ref:`graph construction tutorial<use-own-data>`, users can achieve this by utilizing the ``convert_feat_to_wholegraph.py`` script with ``--dataset-path`` pointing to the folder with the partitioned graph data and specify the features to be transformed using the ``--feat-names`` option. For example:
+Different from typical GraphStorm training where node features are stored in the ``node_feat.dgl`` in each partition, to utilize WholeGraph, the node features must be converted into a compatible WholeGraph format. After construct your raw data into GraphStorm required DistDGL format following this :ref:`graph construction tutorial<use-own-data>`, users can achieve this by utilizing the `convert_feat_to_wholegraph.py <https://github.com/awslabs/graphstorm/blob/main/tools/convert_feat_to_wholegraph.py>`_ script with ``--dataset-path`` pointing to the folder with the partitioned graph data and specify the features to be transformed using the ``--node-feat-names`` option. For example:
 
 .. code:: bash
 
     python3 convert_feat_to_wholegraph.py \
             --dataset-path ogbn-mag240m-2p \
-            --feat-names paper:feat
+            --node-feat-names paper:feat
 
 You can provide multiple features names such as ``--feat-names paper:feat author:feat1,feat2 institution:feat``.
 
@@ -157,13 +195,13 @@ For example link prediction task can be initiated using the following command:
 
     python3 -m graphstorm.run.gs_link_prediction \
             --workspace /data/ogbn_mag_lp/ \
-            --num_trainers 4 \
-            --num_servers 1 \
-            --num_samplers 0 \
-            --part_config /data/ogbn_mag_lp_2p/ogbn-mag.json \
-            --ip_config /data/ip_list.txt \
-            --ssh_port 2222 \
-            --graph_format csc,coo \
+            --num-trainers 4 \
+            --num-servers 1 \
+            --num-samplers 0 \
+            --part-config /data/ogbn_mag_lp_2p/ogbn-mag.json \
+            --ip-config /data/ip_list.txt \
+            --ssh-port 2222 \
+            --graph-format csc,coo \
             --cf /graphstorm/training_scripts/gsgnn_lp/mag_lp.yaml \
             --node-feat-name paper:feat
 

@@ -19,12 +19,13 @@ GraphStorm's `graphstorm.run.launch <https://github.com/awslabs/graphstorm/blob/
 - **ssh-port**: SSH port used by the host node to communicate with the other nodes in the cluster.
 - **ssh-username**: Optional. When issuing commands (via ssh) to cluster, use the provided username in the ssh command.
 - **graph-format**: The format of the graph structure of each partition. The allowed formats are csr, csc and coo. A user can specify multiple formats, separated by ",". For example, the graph format is "csr,csc".
+- **cf** or **yaml-config-file**: (**Required**) Path to the YAML configuration file.
 - **extra-envs**: Extra environment parameters need to be set. For example, you can set the LD_LIBRARY_PATH and NCCL_DEBUG by adding:
 
     - --extra_envs LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
     - --extra-envs LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
     - NCCL_DEBUG=INFO
-- **lm-encoder-only**: Indicate that the model is using language model + decoder only. model. No GNN is involved, only graph structure.
+- **do-nid-remap**: Do GraphStorm node ID to Raw input node ID remapping for prediction results and node embeddings. Default is True.
 
 ..  note:: Below configurations can be set either in a YAML configuration file or be added as arguments of launch command.
 
@@ -45,7 +46,7 @@ Model Configurations
 --------------------------------
 GraphStorm provides a set of parameters to config the GNN model structure (input layer, gnn layer, decoder layer, etc)
 
-- **model_encoder_type**: (**Required**) The Encoder module used to encode graph data. It can be a GNN encoder or a non-GNN encoder. A GNN encoder is composed of an input module, which encodes input node features, and a GNN module. A non-GNN encoder only contains an input module. GraphStorm supports two GNN encoders: `rgcn` which uses relational graph convolutional network as its GNN module and `rgat` which uses relational graph attention network as its GNN module. GraphStorm supports two non-GNN encoder: `lm` which requires each node type has and only has text features and uses language model, e.g., Bert, to encode these features and `mlp` which accepts various types of input node features (text feature, floating points and learnable embeddings) and finally uses an MLP to project these features into same dimension.
+- **model_encoder_type**: (**Required**) The Encoder module used to encode graph data. It can be a GNN encoder or a non-GNN encoder. A GNN encoder is composed of an input module, which encodes input node features, and a GNN module. A non-GNN encoder only contains an input module. GraphStorm supports five GNN encoders: `rgcn` which uses relational graph convolutional network as its GNN module, `rgat` which uses relational graph attention network as its GNN module, `sage` which uses GraphSage as its GNN module (only works with homogeneous graph), `gat` which uses graph attention network as its GNN module (only works with homogeneous graph) and `hgt` which uses heterogenous graph transformer as its GNN module. GraphStorm supports two non-GNN encoder: `lm` which requires each node type has and only has text features and uses language model, e.g., Bert, to encode these features and `mlp` which accepts various types of input node features (text feature, floating points and learnable embeddings) and finally uses an MLP to project these features into same dimension.
 
     - Yaml: ``model_encoder_type: rgcn``
     - Argument: ``--model-encoder-type rgcn``
@@ -287,6 +288,11 @@ GraphStorm provides a set of parameters to control model evaluation.
     - Yaml: ``no_validation: true``
     - Argument: ``--no-validation true``
     - Default value: ``false``
+- **fixed_test_size**: Set the number of validation and test data used during link prediction training evaluaiotn. This is useful for reducing the overhead of doing link prediction evaluation when the graph size is large.
+
+    - Yaml: ``fixed_test_size: 100000``
+    - Argument: ``--fixed-test-size 100000``
+    - Default value: None, Use the full validation and test set.
 
 Language Model Specific Configurations
 ---------------------------------------------------
@@ -472,10 +478,10 @@ Link Prediction Task
     - Yaml: ``gamma: 10.0``
     - Argument: ``--gamma 10.0``
     - Default value: ``12.0``
-- **lp_loss_func**: Link prediction loss function. Builtin loss functions include ``cross_entropy`` and ``logsigmoid``.
+- **lp_loss_func**: Link prediction loss function. Builtin loss functions include ``cross_entropy`` and ``contrastive``.
 
     - Yaml: ``lp_loss_func: cross_entropy``
-    - Argument: ``--lp-loss-func logsigmoid``
+    - Argument: ``--lp-loss-func contrastive``
     - Default value: ``cross_entropy``
 
 - **lp_edge_weight_for_loss**: Edge feature field name for edge weight. The edge weight is used to rescale the positive edge loss for link prediction tasks.
@@ -487,6 +493,18 @@ Link Prediction Task
                 | ``- "ntype0,rel0,ntype1:weight0"``
                 | ``- "ntype0,rel1,ntype1:weight1"``
     - Argument: ``--lp-edge-weight-for-loss ntype0,rel0,ntype1:weight0 ntype0,rel1,ntype1:weight1``
+    - Default value: None
+
+- **contrastive-loss-temperature**: Temperature of link prediction contrastive loss. This is used to rescale the link prediction positive and negative scores for the loss.
+
+    - Yaml: ``contrastive_loss_temperature: 0.01```
+    - Argument: ``--contrastive-loss-temperature 0.01``
+    - Default value: 1.0
+
+- **lp-embed-normalizer**: Type of normalization method used to normalize node embeddings in link prediction tasks. Currently GraphStorm only supports l2 normalization (`l2_norm`).
+
+    - Yaml: ``lp_embed_normalizer: l2_norm``
+    - Argument: ``--lp-embed-normalizer l2_norm``
     - Default value: None
 
 Distillation Specific Configurations
