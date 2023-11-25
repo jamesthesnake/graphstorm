@@ -28,9 +28,19 @@ import torch as th
 import numpy as np
 
 TORCH_MAJOR_VER = int(th.__version__.split('.', maxsplit=1)[0])
+USE_WHOLEGRAPH = False
 
 def setup_device(local_rank):
-    """Setup computation device
+    r"""Setup computation device.
+
+    Parameters
+    -----------
+    local_rank: int
+        Rank of the current process in a distributed environment.
+
+    Returns
+    -------
+    str: device where the model runs.
     """
     if th.cuda.is_available():
         assert local_rank < th.cuda.device_count(), \
@@ -76,8 +86,15 @@ def barrier():
 def use_wholegraph(part_config):
     """ Use wholegraph for feature fetching if 'wholegraph' folder exists
     """
-    return bool(part_config is not None and os.path.isdir(os.path.join( \
+    global USE_WHOLEGRAPH
+    USE_WHOLEGRAPH = bool(part_config is not None and os.path.isdir(os.path.join( \
         os.path.dirname(part_config), 'wholegraph')))
+    return USE_WHOLEGRAPH
+
+def is_wholegraph():
+    """ Check whether global USE_WHOLEGRAPH is true
+    """
+    return USE_WHOLEGRAPH
 
 def estimate_mem_train(root, task):
     ''' Estimate the memory consumption per machine during training.
@@ -238,6 +255,25 @@ def get_log_level(log_level):
     else:
         raise ValueError(f"Unknown logging level {log_level}. " + \
                 "The possible values are: debug, info, warning, error.")
+
+def create_dist_tensor(shape, dtype, name=None, part_policy=None, persistent=False):
+    """ A wrapper function to create a distributed tensor.
+    """
+    tensor = dgl.distributed.DistTensor(shape, dtype, name=name,
+                                        part_policy=part_policy, persistent=persistent)
+    logging.debug("Create DistTensor of %s with shape of %s", name, str(tensor.shape))
+    return tensor
+
+def get_lm_ntypes(lm_configs):
+    """ Get the node types with text features.
+    """
+    if lm_configs is None:
+        return None
+
+    ntypes = []
+    for config in lm_configs:
+        ntypes.extend(config['node_types'])
+    return ntypes
 
 class SysTracker:
     """ This tracks the system performance.

@@ -19,24 +19,44 @@ import os
 import tempfile
 import shutil
 import numpy as np
+import multiprocessing as mp
+import torch.distributed as dist
 from unittest.mock import patch, MagicMock
 
 import torch as th
 import dgl
 import pytest
-from data_utils import generate_dummy_dist_graph, generate_dummy_dist_graph_reconstruct
+from data_utils import (
+    generate_dummy_dist_graph,
+    generate_dummy_dist_graph_reconstruct,
+    create_distill_data,
+)
 
 import graphstorm as gs
+from graphstorm.utils import setup_device
 from graphstorm.dataloading import GSgnnNodeTrainData, GSgnnNodeInferData
 from graphstorm.dataloading import GSgnnEdgeTrainData, GSgnnEdgeInferData
 from graphstorm.dataloading import GSgnnAllEtypeLinkPredictionDataLoader
-from graphstorm.dataloading import GSgnnNodeDataLoader, GSgnnEdgeDataLoader
+from graphstorm.dataloading import (GSgnnNodeDataLoader,
+                                    GSgnnEdgeDataLoader,
+                                    GSgnnNodeSemiSupDataLoader)
 from graphstorm.dataloading import (GSgnnLinkPredictionDataLoader,
-                                   FastGSgnnLinkPredictionDataLoader)
+                                    GSgnnLPJointNegDataLoader,
+                                    GSgnnLPInBatchJointNegDataLoader,
+                                    GSgnnLPLocalUniformNegDataLoader,
+                                    GSgnnLPLocalJointNegDataLoader,
+                                    FastGSgnnLinkPredictionDataLoader,
+                                    FastGSgnnLPJointNegDataLoader,
+                                    FastGSgnnLPLocalUniformNegDataLoader,
+                                    FastGSgnnLPLocalJointNegDataLoader)
 from graphstorm.dataloading import GSgnnLinkPredictionTestDataLoader
 from graphstorm.dataloading import GSgnnLinkPredictionJointTestDataLoader
+from graphstorm.dataloading import DistillDataloaderGenerator, DistillDataManager
+from graphstorm.dataloading import DistributedFileSampler
 from graphstorm.dataloading import BUILTIN_LP_UNIFORM_NEG_SAMPLER
 from graphstorm.dataloading import BUILTIN_LP_JOINT_NEG_SAMPLER
+
+from graphstorm.dataloading.sampler import InbatchJointUniform
 
 from graphstorm.dataloading.dataset import (prepare_batch_input,
                                             prepare_batch_edge_input)
@@ -44,6 +64,8 @@ from graphstorm.dataloading.utils import modify_fanout_for_target_etype
 from graphstorm.dataloading.utils import trim_data
 
 from numpy.testing import assert_equal
+from transformers import AutoTokenizer
+from torch.utils.data import DataLoader
 
 def get_nonzero(mask):
     mask = mask[0:len(mask)]
@@ -178,8 +200,10 @@ def test_GSgnnEdgeData():
     for etype in tr_etypes:
         assert th.all(tr_data1.test_idxs[etype] == get_nonzero(dist_graph.edges[etype[1]].data['test_mask']))
     assert len(ev_data.test_idxs) == len(va_etypes)
+    assert len(ev_data.infer_idxs) == len(ev_data.test_idxs)
     for etype in va_etypes:
         assert th.all(ev_data.test_idxs[etype] == get_nonzero(dist_graph.edges[etype[1]].data['test_mask']))
+        assert th.all(ev_data.infer_idxs[etype] == get_nonzero(dist_graph.edges[etype[1]].data['test_mask']))
 
     # pass train etypes as None
     assert len(tr_data2.train_idxs) == len(dist_graph.canonical_etypes)
@@ -201,8 +225,10 @@ def test_GSgnnEdgeData():
 
     # pass eval etypes as None
     assert len(ev_data2.test_idxs) == 2
+    assert len(ev_data2.infer_idxs) == 2
     for etype in dist_graph.canonical_etypes:
         assert th.all(ev_data2.test_idxs[etype] == get_nonzero(dist_graph.edges[etype[1]].data['test_mask']))
+        assert th.all(ev_data2.infer_idxs[etype] == get_nonzero(dist_graph.edges[etype[1]].data['test_mask']))
 
     labels = tr_data.get_labels({('n0', 'r1', 'n1'): [0, 1]})
     assert len(labels.keys()) == 1
@@ -273,8 +299,10 @@ def test_GSgnnNodeData():
     for ntype in tr_ntypes:
         assert th.all(tr_data1.test_idxs[ntype] == get_nonzero(dist_graph.nodes[ntype].data['test_mask']))
     assert len(ev_data.test_idxs) == len(va_ntypes)
+    assert len(ev_data.infer_idxs) == len(va_ntypes)
     for ntype in va_ntypes:
         assert th.all(ev_data.test_idxs[ntype] == get_nonzero(dist_graph.nodes[ntype].data['test_mask']))
+        assert th.all(ev_data.infer_idxs[ntype] == get_nonzero(dist_graph.nodes[ntype].data['test_mask']))
 
     labels = tr_data.get_labels({'n1': [0, 1]})
     assert len(labels.keys()) == 1
@@ -613,6 +641,23 @@ def test_GSgnnLinkPredictionTestDataLoader(batch_size, num_negative_edges):
                 assert neg_src.shape[1] == num_negative_edges
                 assert th.all(neg_src < g.number_of_nodes(canonical_etype[0]))
 
+        fixed_test_size = 10
+        dataloader = GSgnnLinkPredictionTestDataLoader(
+            lp_data,
+            target_idx=lp_data.train_idxs, # use train edges as val or test edges
+            batch_size=batch_size,
+            num_negative_edges=num_negative_edges,fixed_test_size=fixed_test_size)
+        num_samples = 0
+        for pos_neg_tuple, sample_type in dataloader:
+            num_samples += 1
+            assert isinstance(pos_neg_tuple, dict)
+            assert len(pos_neg_tuple) == 1
+            for _, pos_neg in pos_neg_tuple.items():
+                pos_src, _, pos_dst, _ = pos_neg
+                assert len(pos_src) <= batch_size
+
+        assert num_samples ==  -(-fixed_test_size // batch_size) * 2
+
     # after test pass, destroy all process group
     th.distributed.destroy_process_group()
 
@@ -894,8 +939,429 @@ def test_edge_dataloader_trim_data(dataloader):
     # after test pass, destroy all process group
     th.distributed.destroy_process_group()
 
+def get_dist_sampler_attributes(rank, world_size, num_files):
+    """
+    Assign a slice window of file index to each worker.
+    The slice window of each worker is specified
+    by self.global_start and self.global_end
+    """
+    if world_size > num_files:
+        # If num of workers is greater than num of files,
+        # the slice windows are same across all workers,
+        # which covers all files.
+        remainder = world_size % num_files
+        global_start = 0
+        global_end = num_files
+        part_len = global_end
+    else:
+        # If num of workers is smaller than num of files,
+        # the slice windows are different for each worker.
+        # In the case where the files cannot be evenly distributed,
+        # the remainder will be assigned to one or multiple workers evenly.
+        part_len = num_files // world_size
+        remainder = num_files % world_size
+        global_start = part_len * rank + min(rank, remainder)
+        global_end = global_start + part_len + (rank < remainder)
+        part_len = global_end - global_start
+    return global_start, global_end, part_len, remainder
+
+@pytest.mark.parametrize("num_files", [3, 7, 8])
+def test_distill_sampler_get_file(num_files):
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        create_distill_data(tmpdirname, num_files)
+        file_list = os.listdir(tmpdirname)
+        tracker = {
+            "global_start": [],
+            "global_end": [],
+            "part_len": [],
+        }
+        for rank in range(4):
+            dist_sampler = DistributedFileSampler(
+                        dataset_path=tmpdirname,
+                        shuffle=False,
+                        local_rank=rank,
+                        world_size=4,
+                        is_train=True,
+                        infinite=True,
+                    )
+
+            # test DistributedFileSampler._file_index_distribute
+            global_start, global_end, part_len, remainder = \
+                get_dist_sampler_attributes(rank, 4, num_files)
+            assert global_start == dist_sampler.global_start
+            assert global_end == dist_sampler.global_end
+            assert part_len == dist_sampler.part_len
+            assert remainder == dist_sampler.remainder
+            tracker["global_start"].append(dist_sampler.global_start)
+            tracker["global_end"].append(dist_sampler.global_end)
+            tracker["part_len"].append(dist_sampler.part_len)
+            if rank == 0:
+                tracker["remainder"] = dist_sampler.remainder
+
+            # test DistributedFileSampler.get_file
+            if num_files == 3:
+                if rank == 0 or rank == 3:
+                    target_index = [0, 2, 1]
+                elif rank == 1:
+                    target_index = [1, 0, 2]
+                elif rank == 2:
+                    target_index = [2, 1, 0]
+
+            if num_files == 7:
+                if rank == 0:
+                    target_index = [0, 1]
+                elif rank == 1:
+                    target_index = [2, 3]
+                elif rank == 2:
+                    target_index = [4, 5]
+                elif rank == 3:
+                    target_index = [6]
+
+            if num_files == 8:
+                if rank == 0:
+                    target_index = [0, 1]
+                elif rank == 1:
+                    target_index = [2, 3]
+                elif rank == 2:
+                    target_index = [4, 5]
+                elif rank == 3:
+                    target_index = [6, 7]
+            for offset in range(2*num_files):
+                assert os.path.join(tmpdirname, file_list[target_index[offset%len(target_index)]]) == \
+                    dist_sampler.get_file(offset)
+
+        # test relative relation
+        if num_files >= 4:
+            assert tracker["global_end"][0] == tracker["global_start"][1]
+            assert tracker["global_end"][1] == tracker["global_start"][2]
+            assert tracker["global_end"][2] == tracker["global_start"][3]
+            total_len = 0
+            for rank in range(4):
+                assert tracker["part_len"][rank] == \
+                    tracker["global_end"][rank] - tracker["global_start"][rank]
+                total_len += tracker["part_len"][rank]
+            assert total_len == num_files
+        else:
+            for rank in range(4):
+                assert tracker["part_len"][rank] == num_files
+                assert tracker["global_start"][rank] == 0
+                assert tracker["global_end"][rank] == num_files
+                assert tracker["remainder"] == 4 % num_files
+
+@pytest.mark.parametrize("num_files", [3, 7, 8])
+@pytest.mark.parametrize("is_train", [True, False])
+@pytest.mark.parametrize("infinite", [False, True])
+@pytest.mark.parametrize("shuffle", [True, False])
+def test_DistillDistributedFileSampler(num_files, is_train,
+    infinite, shuffle):
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        create_distill_data(tmpdirname, num_files)
+        global_sampled_files = []
+
+        # set world_size to 4
+        # test 1) when num_files < world size.
+        # 2) when num_files >= world size and can be evenly divided.
+        # 3) when num_files > world size and cannot be evenly divided.
+
+        for rank in range(4):
+            device = setup_device(rank)
+
+            file_sampler = DistributedFileSampler(
+                    dataset_path=tmpdirname,
+                    shuffle=shuffle,
+                    local_rank=rank,
+                    world_size=4,
+                    is_train=is_train,
+                    infinite=infinite,
+                )
+            if is_train and num_files >= 4:
+                assert file_sampler.part_len >= (num_files // 4)
+                assert file_sampler.part_len <= (num_files // 4) + 1
+            else:
+                assert file_sampler.part_len == num_files
+
+            file_sampler_iter = iter(file_sampler)
+            if is_train and infinite:
+                local_sampled_files = []
+                for i, data_file in enumerate(file_sampler_iter):
+                    if i == file_sampler.part_len:
+                        assert data_file.split("/")[-1] in local_sampled_files, \
+                            "Infinite sampler doesn't sample evenly."
+                        break
+                    global_sampled_files.append(data_file.split("/")[-1])
+                    local_sampled_files.append(data_file.split("/")[-1])
+            else:
+                for i, data_file in enumerate(file_sampler_iter):
+                    if data_file is None:
+                        break
+                    assert i < file_sampler.part_len, \
+                        "Non-infinite sampler doesn't exit."
+                    global_sampled_files.append(data_file.split("/")[-1])
+        assert set(global_sampled_files) == set(os.listdir(tmpdirname))
+
+
+def run_distill_dist_data(worker_rank, world_size,
+    backend, tmpdirname, num_files, is_train):
+    dist_init_method = 'tcp://{master_ip}:{master_port}'.format(
+        master_ip='127.0.0.1', master_port='12345')
+    th.distributed.init_process_group(backend=backend,
+                                      init_method=dist_init_method,
+                                      world_size=world_size,
+                                      rank=worker_rank)
+    th.cuda.set_device(worker_rank)
+    device = setup_device(worker_rank)
+
+    tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+
+    dataloader_generator = DistillDataloaderGenerator(
+        tokenizer=tokenizer,
+        max_seq_len=8,
+        device=device,
+        batch_size=4,
+    )
+    data_mgr = DistillDataManager(
+        dataloader_generator,
+        dataset_path=tmpdirname,
+        local_rank=worker_rank,
+        world_size=world_size,
+        is_train=is_train,
+    )
+
+    if is_train and num_files >= 4:
+        assert len(data_mgr) >= num_files // 4
+        assert len(data_mgr) <= num_files // 4 + 1
+    else:
+        assert len(data_mgr) == num_files
+
+    dataset_iterator = data_mgr.get_iterator()
+    assert isinstance(dataset_iterator, DataLoader)
+    batch = next(iter(dataset_iterator))
+    assert len(batch) == 3
+
+    data_mgr.refresh_manager()
+
+    if is_train:
+        train_idx = 0
+        while True:
+            dataset_iterator = data_mgr.get_iterator()
+            assert isinstance(dataset_iterator, DataLoader)
+            num_batches = th.tensor(len(dataset_iterator), \
+                dtype=th.int64, device=device)
+            dist.all_reduce(num_batches, op=dist.ReduceOp.MIN)
+            min_size = num_batches.item()
+            assert int(min_size) == int(num_batches)
+            if train_idx == 2 * num_files:
+                break
+            train_idx += 1
+    else:
+        for i, dataset_iterator in enumerate(data_mgr):
+            if i < len(data_mgr):
+                assert isinstance(dataset_iterator, DataLoader)
+            if dataset_iterator is None:
+                assert i == len(data_mgr)
+                break
+            assert i < len(data_mgr), \
+                "DistillDataManager doesn't exit."
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl"])
+@pytest.mark.parametrize("num_files", [3, 7, 8])
+@pytest.mark.parametrize("is_train", [True, False])
+def test_DistillDataloaderGenerator(backend, num_files, is_train):
+    # test DistillDataloaderGenerator
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        create_distill_data(tmpdirname, num_files)
+        ctx = mp.get_context('spawn')
+        p0 = ctx.Process(target=run_distill_dist_data,
+                        args=(0, 4, backend, tmpdirname, num_files, is_train))
+        p1 = ctx.Process(target=run_distill_dist_data,
+                        args=(1, 4, backend, tmpdirname, num_files, is_train))
+        p2 = ctx.Process(target=run_distill_dist_data,
+                        args=(2, 4, backend, tmpdirname, num_files, is_train))
+        p3 = ctx.Process(target=run_distill_dist_data,
+                        args=(3, 4, backend, tmpdirname, num_files, is_train))
+
+        p0.start()
+        p1.start()
+        p2.start()
+        p3.start()
+        p0.join()
+        p1.join()
+        p2.join()
+        p3.join()
+        assert p0.exitcode == 0
+        assert p1.exitcode == 0
+        assert p2.exitcode == 0
+        assert p3.exitcode == 0
+
+@pytest.mark.parametrize("batch_size", [10, 11])
+def test_np_dataloader_len(batch_size):
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        # get the test dummy distributed graph
+        _, part_config = generate_dummy_dist_graph(graph_name='dummy', dirname=tmpdirname)
+        np_data = GSgnnNodeTrainData(graph_name='dummy', part_config=part_config,
+                                     train_ntypes=['n1'], label_field='label')
+
+    # Without shuffling, the seed nodes should have the same order as the target nodes.
+    target_idx = {'n1': th.arange(np_data.g.number_of_nodes('n1'))}
+    dataloader = GSgnnNodeDataLoader(np_data, target_idx, [10], batch_size, 'cuda:0',
+                                     train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnNodeDataLoader(np_data, target_idx, [10], batch_size, 'cuda:0',
+                                     train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+    target_idx_2 = {'n1': th.arange(np_data.g.number_of_nodes('n1')//2)}
+    # target_idx > unlabeled_idx
+    dataloader = GSgnnNodeSemiSupDataLoader(np_data, target_idx, target_idx_2, [10], batch_size, 'cuda:0',
+                                     train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnNodeSemiSupDataLoader(np_data, target_idx, target_idx_2, [10], batch_size, 'cuda:0',
+                                     train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+    # target_idx < unlabeled_idx
+    dataloader = GSgnnNodeSemiSupDataLoader(np_data, target_idx_2, target_idx, [10], batch_size, 'cuda:0',
+                                     train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnNodeSemiSupDataLoader(np_data, target_idx_2, target_idx, [10], batch_size, 'cuda:0',
+                                     train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+@pytest.mark.parametrize("batch_size", [10, 11])
+def test_ep_dataloader_len(batch_size):
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        # get the test dummy distributed graph
+        _, part_config = generate_dummy_dist_graph(graph_name='dummy', dirname=tmpdirname)
+        ep_data = GSgnnEdgeTrainData(graph_name='dummy', part_config=part_config,
+                                     train_etypes=[('n0', 'r1', 'n1')], label_field='label')
+
+    ################### Test train_task #######################
+
+    # Without shuffling, the seed nodes should have the same order as the target nodes.
+    target_idx = {('n0', 'r1', 'n1'): th.arange(ep_data.g.number_of_edges('r1'))}
+    dataloader = GSgnnEdgeDataLoader(ep_data, target_idx, [10], batch_size, 'cuda:0',
+                                     train_task=False, remove_target_edge_type=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnEdgeDataLoader(ep_data, target_idx, [10], batch_size, 'cuda:0',
+                                     train_task=True, remove_target_edge_type=False)
+    assert len(dataloader) == len(list(dataloader))
+
+@pytest.mark.parametrize("batch_size", [10, 11])
+def test_lp_dataloader_len(batch_size):
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        # get the test dummy distributed graph
+        _, part_config = generate_dummy_dist_graph(graph_name='dummy', dirname=tmpdirname)
+        ep_data = GSgnnEdgeTrainData(graph_name='dummy', part_config=part_config,
+                                     train_etypes=[('n0', 'r1', 'n1')])
+
+    ################### Test train_task #######################
+
+    # Without shuffling, the seed nodes should have the same order as the target nodes.
+    target_idx = {('n0', 'r1', 'n1'): th.arange(ep_data.g.number_of_edges('r1'))}
+    dataloader = GSgnnLinkPredictionDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnLinkPredictionDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnLPJointNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnLPJointNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnLPLocalUniformNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnLPLocalUniformNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnLPInBatchJointNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnLPLocalJointNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = GSgnnLPLocalJointNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = FastGSgnnLinkPredictionDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = FastGSgnnLinkPredictionDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = FastGSgnnLPJointNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = FastGSgnnLPJointNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = FastGSgnnLPLocalUniformNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = FastGSgnnLPLocalUniformNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = FastGSgnnLPLocalJointNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=False)
+    assert len(dataloader) == len(list(dataloader))
+
+    dataloader = FastGSgnnLPLocalJointNegDataLoader(ep_data, target_idx, [10], batch_size, num_negative_edges=2,
+                                               device='cuda:0', train_task=True)
+    assert len(dataloader) == len(list(dataloader))
+
+@pytest.mark.parametrize("num_pos", [2, 10])
+@pytest.mark.parametrize("num_neg", [5, 20])
+def test_inbatch_joint_neg_sampler(num_pos, num_neg):
+    src = th.arange(num_pos)
+    dst = th.arange(num_pos)
+    g = dgl.heterograph({
+        ("n0", "r0", "n1"): (src, dst),
+    })
+    sampler = InbatchJointUniform(num_neg)
+    src, dst = sampler._generate(g, th.arange(num_pos), ("n0", "r0", "n1"))
+    # In batch joint negative includes
+    # uniform negatives + in-batch negatives.
+    assert len(src) == num_pos * num_neg +  num_pos * (num_pos - 1)
+    assert len(dst) == num_pos * num_neg + num_pos * (num_pos - 1)
+    in_batch_src = src[-num_pos * (num_pos - 1):]
+    in_batch_dst = dst[-num_pos * (num_pos - 1):]
+
+    for i in range(num_pos):
+        assert_equal(in_batch_src[i*(num_pos-1):(i+1)*(num_pos-1)].numpy(), np.repeat(i, (num_pos-1)))
+        tmp_idx = np.ones(num_pos, dtype=bool)
+        tmp_idx[i] = False
+        assert_equal(in_batch_dst[i*(num_pos-1):(i+1)*(num_pos-1)].numpy(),
+                     np.arange(num_pos)[tmp_idx])
+
 
 if __name__ == '__main__':
+    test_inbatch_joint_neg_sampler(10, 20)
+
+    test_np_dataloader_len(11)
+    test_ep_dataloader_len(11)
+    test_lp_dataloader_len(11)
+
     test_np_dataloader_trim_data(GSgnnNodeDataLoader)
     test_edge_dataloader_trim_data(GSgnnLinkPredictionDataLoader)
     test_edge_dataloader_trim_data(FastGSgnnLinkPredictionDataLoader)
@@ -916,3 +1382,8 @@ if __name__ == '__main__':
 
     test_prepare_input()
     test_modify_fanout_for_target_etype()
+
+    test_distill_sampler_get_file(num_files=7)
+    test_DistillDistributedFileSampler(num_files=7, is_train=True, \
+        infinite=False, shuffle=True)
+    test_DistillDataloaderGenerator("gloo", 7, True)
