@@ -15,8 +15,7 @@
 
     Heterogeneous Graph Transformer (HGT) layer implementation
 """
-import warnings
-
+import logging
 import math
 import torch
 import torch.nn.functional as F
@@ -68,11 +67,23 @@ class HGTLayer(nn.Module):
 
     Note:
     -----
-    * Different from DGL's HGTConv, this implementation is based on heterogeneous graph. Other 
+    * Different from DGL's HGTConv, this implementation is based on heterogeneous graph. Other
       hyperparameters' default values are same as the DGL's HGTConv setting.
 
     * The cross-relation aggregation function of this implementation is `mean`, which was chosen
       by authors of the HGT paper in their contribution to DGL.
+
+    Examples:
+    ----------
+
+    .. code:: python
+
+        # suppose graph and input_feature are ready
+        from graphstorm.model.hgt_encoder import HGTLayer
+
+        layer = HGTLayer(hid_dim, out_dim, g.ntypes, g.canonical_etypes,
+                         num_heads, activation, dropout, norm)
+        h = layer(g, input_feature)
 
     Parameters
     ----------
@@ -189,14 +200,11 @@ class HGTLayer(nn.Module):
         """
         # pylint: disable=no-member
         with g.local_scope():
+            edge_fn = {}
             for srctype, etype, dsttype in g.canonical_etypes:
                 c_etype_str = '_'.join((srctype, etype, dsttype))
                 # extract each relation as a sub graph
                 sub_graph = g[srctype, etype, dsttype]
-
-                # check if no edges exist for this can_etype
-                if sub_graph.num_edges() == 0:
-                    continue
 
                 k_linear = self.k_linears[srctype]
                 v_linear = self.v_linears[srctype]
@@ -227,9 +235,6 @@ class HGTLayer(nn.Module):
                 attn_score = edge_softmax(sub_graph, attn_score, norm_by='dst')
                 sub_graph.edata[f't_{c_etype_str}'] = attn_score.unsqueeze(-1)
 
-            edge_fn = {}
-            for srctype, etype, dsttype in g.canonical_etypes:
-                c_etype_str = '_'.join((srctype, etype, dsttype))
                 edge_fn[srctype, etype, dsttype] = (fn.u_mul_e(f'v_{c_etype_str}',
                                                                f't_{c_etype_str}', 'm'),
                                                     fn.sum('m', 't'))
@@ -242,19 +247,26 @@ class HGTLayer(nn.Module):
                     alpha = torch.sigmoid(self.skip[k])
                     if g.dstnodes[k].data.get('t') is not None:
                         t = g.dstnodes[k].data['t'].view(-1, self.out_dim)
-                        trans_out = self.drop(self.a_linears[k](t))
+                        trans_out = self.drop(t)
                         if g.is_block:
-                            trans_out = trans_out * alpha + h[k][:g.num_dst_nodes(k)] * (1-alpha)
+                            trans_out = trans_out * alpha + \
+                                self.a_linears[k](h[k][:g.num_dst_nodes(k)]) * (1-alpha)
                         else:
-                            trans_out = trans_out * alpha + h[k] * (1-alpha)
+                            trans_out = trans_out * alpha + self.a_linears[k](h[k]) * (1-alpha)
                     else:                       # Nodes not really in destination side.
-                        warnings.warn("Warning. Graph convolution returned empty "
-                          f"dictionary, for node with type: {str(k)}")
-                        # So add psudo self-loop with feature copy.
-                        trans_out = self.drop(self.a_linears[k](h[k]))
-                        trans_out = trans_out * alpha + h[k] * (1-alpha)
+                        logging.warning("Warning. Graph convolution returned empty " + \
+                          f"dictionary for nodes in type: {str(k)}. Please check your data" + \
+                          f" for no in-degree nodes in type: {str(k)}.")
+                        # So add psudo self-loop for the destination nodes with its own feature.
+                        dst_h = self.a_linears[k](h[k][:g.num_dst_nodes(k)])
+                        trans_out = self.drop(dst_h)
+                        trans_out = trans_out * alpha + dst_h * (1-alpha)
                 else:
-                    continue
+                    # Handle zero number of dst nodes, which is an extreme case
+                    if g.dstnodes[k].data.get('t') is not None:
+                        trans_out = self.a_linears[k](h[k])
+                    else:
+                        continue
 
                 if self.use_norm:
                     new_h[k] = self.norms[k](trans_out)
@@ -271,7 +283,8 @@ class HGTLayer(nn.Module):
 class HGTEncoder(GraphConvEncoder):
     r"""Heterogenous graph transformer (HGT) encoder
 
-    Encoder component that includes layers of HGTLayer.
+    The HGTEncoder employs several HGTLayers as its encoding mechanism.
+    The HGTEncoder should be designated as the model's encoder within Graphstorm.
 
     Parameters
     g : DGLHeteroGraph
@@ -290,6 +303,43 @@ class HGTEncoder(GraphConvEncoder):
         Normalization Method. Default: None
     num_ffn_layers_in_gnn: int
         Number of ngnn gnn layers between GNN layers
+
+    Examples:
+    ----------
+
+    .. code:: python
+
+        # Build model and do full-graph inference on HGTEncoder
+        from graphstorm import get_feat_size
+        from graphstorm.model.hgt_encoder import HGTEncoder
+        from graphstorm.model.edge_decoder import MLPEdgeDecoder
+        from graphstorm.model import GSgnnEdgeModel, GSNodeEncoderInputLayer
+        from graphstorm.dataloading import GSgnnNodeTrainData
+        from graphstorm.model import do_full_graph_inference
+
+        np_data = GSgnnNodeTrainData(...)
+
+        model = GSgnnEdgeModel(alpha_l2norm=0)
+        feat_size = get_feat_size(np_data.g, 'feat')
+        encoder = GSNodeEncoderInputLayer(g, feat_size, 4,
+                                          dropout=0,
+                                          use_node_embeddings=True)
+        model.set_node_input_encoder(encoder)
+
+        gnn_encoder = HGTEncoder(g,
+                                 hid_dim=4,
+                                 out_dim=4,
+                                 num_hidden_layers=1,
+                                 num_heads=2,
+                                 dropout=0.0,
+                                 norm='layer',
+                                 num_ffn_layers_in_gnn=0)
+        model.set_gnn_encoder(gnn_encoder)
+        model.set_decoder(MLPEdgeDecoder(model.gnn_encoder.out_dims,
+                                         3, multilabel=False, target_etype=("n0", "r1", "n1"),
+                                         num_ffn_layers=num_ffn_layers))
+
+        h = do_full_graph_inference(model, np_data)
     """
     def __init__(self,
                  g,
@@ -334,7 +384,7 @@ class HGTEncoder(GraphConvEncoder):
             Sampled subgraph in DGL MFG
         h: dict[str, torch.Tensor]
             Input node feature for each node type.
-            
+
         Returns
         ----------
         h: dict[str, torch.Tensor]

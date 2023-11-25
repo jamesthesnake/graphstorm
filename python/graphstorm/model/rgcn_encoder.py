@@ -15,18 +15,68 @@
 
     RGCN layer implementation.
 """
+import logging
 
 import torch as th
 from torch import nn
 import torch.nn.functional as F
 import dgl.nn as dglnn
 
+from dgl.nn.pytorch.hetero import get_aggregate_fn
 from .ngnn_mlp import NGNNMLP
 from .gnn_encoder_base import GraphConvEncoder
 
 
 class RelGraphConvLayer(nn.Module):
-    r"""Relational graph convolution layer.
+    r"""Relational graph convolution layer from `Modeling Relational Data
+    with Graph Convolutional Networks <https://arxiv.org/abs/1703.06103>`__.
+
+    A generic module for computing convolution on heterogeneous graphs.
+
+    The relational graph convolution layer applies GraphConv on the relation graphs,
+    which reads the features from source nodes and writes the updated ones to destination nodes.
+    If multiple relations have the same destination node types, their results
+    are aggregated by the specified method. If the relation graph has no edge,
+    the corresponding module will not be called.
+
+    Mathematically for the GraphConv it is defined as follows:
+
+    .. math::
+      h_i^{(l+1)} = \sigma(b^{(l)} + \sum_{j\in\mathcal{N}(i)}\frac{1}{c_{ji}}h_j^{(l)}W^{(l)})
+
+    where :math:`\mathcal{N}(i)` is the set of neighbors of node :math:`i`,
+    :math:`c_{ji}` is the product of the square root of node degrees
+    (i.e.,  :math:`c_{ji} = \sqrt{|\mathcal{N}(j)|}\sqrt{|\mathcal{N}(i)|}`),
+    and :math:`\sigma` is an activation function.
+
+    If a weight tensor on each edge is provided, the weighted graph convolution is defined as:
+
+    .. math::
+      h_i^{(l+1)} = \sigma(b^{(l)} + \sum_{j\in\mathcal{N}(i)}\frac{e_{ji}}{c_{ji}}h_j^{(l)}W^{(l)})
+
+    where :math:`e_{ji}` is the scalar weight on the edge from node :math:`j` to node :math:`i`.
+    This is NOT equivalent to the weighted graph convolutional network formulation in the paper.
+
+    Note:
+    -----
+    * In the RelGraphConvLayer, the implementation select 'right' or the default option for the norm
+    to divide the aggregated messages by each node's in-degrees, which is equivalent to averaging
+    the received messages.
+
+    Examples:
+    ----------
+
+    .. code:: python
+
+        # suppose graph and input_feature are ready
+        from graphstorm.model.rgcn_encoder import RelGraphConvLayer
+
+        layer = RelGraphConvLayer(
+                h_dim, h_dim, g.canonical_etypes,
+                num_bases, activation, self_loop,
+                dropout, num_ffn_layers_in_gnn,
+                ffn_activation, norm)
+        h = layer(g, input_feature)
 
     Parameters
     ----------
@@ -78,7 +128,7 @@ class RelGraphConvLayer(nn.Module):
         self.activation = activation
         self.self_loop = self_loop
 
-        self.conv = dglnn.HeteroGraphConv({
+        self.conv = HeteroGraphConv({
                 rel : dglnn.GraphConv(in_feat, out_feat, norm='right', weight=False, bias=False)
                 for rel in rel_names
             })
@@ -194,13 +244,21 @@ class RelGraphConvLayer(nn.Module):
         for k, _ in inputs.items():
             if g.number_of_dst_nodes(k) > 0:
                 if k not in hs:
-                    hs[k] = inputs[k][0:g.number_of_dst_nodes(k)]
+                    logging.warning("Warning. Graph convolution returned empty " + \
+                          f"dictionary for nodes in type: {str(k)}. Please check your data" + \
+                          f" for no in-degree nodes in type: {str(k)}.")
+                    hs[k] = th.zeros((g.number_of_dst_nodes(k),
+                                      self.out_feat),
+                                     device=inputs[k].device)
                     # TODO the above might fail if the device is a different GPU
         return {ntype : _apply(ntype, h) for ntype, h in hs.items()}
 
 
 class RelationalGCNEncoder(GraphConvEncoder):
     r""" Relational graph conv encoder.
+
+    The RelationalGCNEncoder employs several RelGraphConvLayer as its encoding mechanism.
+    The RelationalGCNEncoder should be designated as the model's encoder within Graphstorm.
 
     Parameters
     ----------
@@ -224,6 +282,39 @@ class RelationalGCNEncoder(GraphConvEncoder):
         Number of ngnn gnn layers between GNN layers
     norm : str, optional
         Normalization Method. Default: None
+
+    Examples:
+    ----------
+
+    .. code:: python
+
+        # Build model and do full-graph inference on RelationalGCNEncoder
+        from graphstorm import get_feat_size
+        from graphstorm.model.rgcn_encoder import RelationalGCNEncoder
+        from graphstorm.model.node_decoder import EntityClassifier
+        from graphstorm.model import GSgnnNodeModel, GSNodeEncoderInputLayer
+        from graphstorm.dataloading import GSgnnNodeTrainData
+        from graphstorm.model import do_full_graph_inference
+
+        np_data = GSgnnNodeTrainData(...)
+
+        model = GSgnnNodeModel(alpha_l2norm=0)
+        feat_size = get_feat_size(np_data.g, 'feat')
+        encoder = GSNodeEncoderInputLayer(g, feat_size, 4,
+                                          dropout=0,
+                                          use_node_embeddings=True)
+        model.set_node_input_encoder(encoder)
+
+        gnn_encoder = RelationalGCNEncoder(g, 4, 4,
+                                           num_heads=2,
+                                           num_hidden_layers=1,
+                                           dropout=0,
+                                           use_self_loop=True,
+                                           norm=norm)
+        model.set_gnn_encoder(gnn_encoder)
+        model.set_decoder(EntityClassifier(model.gnn_encoder.out_dims, 3, False))
+
+        h = do_full_graph_inference(model, np_data)
     """
     def __init__(self,
                  g,
@@ -264,7 +355,130 @@ class RelationalGCNEncoder(GraphConvEncoder):
             Sampled subgraph in DGL MFG
         h: dict[str, torch.Tensor]
             Input node feature for each node type.
+
+        Returns
+        ----------
+        h: dict[str, torch.Tensor]
+            Output node feature for each node type.
         """
         for layer, block in zip(self.layers, blocks):
             h = layer(block, h)
         return h
+
+
+class HeteroGraphConv(nn.Module):
+    r"""A generic module for computing convolution on heterogeneous graphs.
+
+
+    Parameters
+    ----------
+    mods : dict[str, nn.Module]
+        Modules associated with every edge types. The forward function of each
+        module must have a `DGLGraph` object as the first argument, and
+        its second argument is either a tensor object representing the node
+        features or a pair of tensor object representing the source and destination
+        node features.
+    aggregate : str, callable, optional
+        Method for aggregating node features generated by different relations.
+        Allowed string values are 'sum', 'max', 'min', 'mean', 'stack'.
+        The 'stack' aggregation is performed along the second dimension, whose order
+        is deterministic.
+        User can also customize the aggregator by providing a callable instance.
+        For example, aggregation by summation is equivalent to the follows:
+
+    Attributes
+    ----------
+    mods : dict[str, nn.Module]
+        Modules associated with every edge types.
+    """
+
+    def __init__(self, mods, aggregate="sum"):
+        super(HeteroGraphConv, self).__init__()
+        self.mod_dict = mods
+        mods = {str(k): v for k, v in mods.items()}
+        # Register as child modules
+        self.mods = nn.ModuleDict(mods)
+        for _, v in self.mods.items():
+            set_allow_zero_in_degree_fn = getattr(
+                v, "set_allow_zero_in_degree", None
+            )
+            if callable(set_allow_zero_in_degree_fn):
+                set_allow_zero_in_degree_fn(True)
+        if isinstance(aggregate, str):
+            self.agg_fn = get_aggregate_fn(aggregate)
+        else:
+            self.agg_fn = aggregate
+
+    def _get_module(self, etype):
+        mod = self.mod_dict.get(etype, None)
+        if mod is not None:
+            return mod
+        if isinstance(etype, tuple):
+            # etype is canonical
+            _, etype, _ = etype
+            return self.mod_dict[etype]
+        raise KeyError("Cannot find module with edge type %s" % etype)
+
+    def forward(self, g, inputs, mod_args=None, mod_kwargs=None):
+        """Forward computation
+
+        Invoke the forward function with each module and aggregate their results.
+
+        Parameters
+        ----------
+        g : DGLGraph
+            Graph data.
+        inputs : dict[str, Tensor] or pair of dict[str, Tensor]
+            Input node features.
+        mod_args : dict[str, tuple[any]], optional
+            Extra positional arguments for the sub-modules.
+        mod_kwargs : dict[str, dict[str, any]], optional
+            Extra key-word arguments for the sub-modules.
+
+        Returns
+        -------
+        dict[str, Tensor]
+            Output representations for every types of nodes.
+        """
+        if mod_args is None:
+            mod_args = {}
+        if mod_kwargs is None:
+            mod_kwargs = {}
+        outputs = {nty: [] for nty in g.dsttypes}
+        if isinstance(inputs, tuple) or g.is_block:
+            if isinstance(inputs, tuple):
+                src_inputs, dst_inputs = inputs
+            else:
+                src_inputs = inputs
+                dst_inputs = {
+                    k: v[: g.number_of_dst_nodes(k)] for k, v in inputs.items()
+                }
+
+            for stype, etype, dtype in g.canonical_etypes:
+                rel_graph = g[stype, etype, dtype]
+                if stype not in src_inputs or dtype not in dst_inputs:
+                    continue
+                dstdata = self._get_module((stype, etype, dtype))(
+                    rel_graph,
+                    (src_inputs[stype], dst_inputs[dtype]),
+                    *mod_args.get((stype, etype, dtype), ()),
+                    **mod_kwargs.get((stype, etype, dtype), {})
+                )
+                outputs[dtype].append(dstdata)
+        else:
+            for stype, etype, dtype in g.canonical_etypes:
+                rel_graph = g[stype, etype, dtype]
+                if stype not in inputs:
+                    continue
+                dstdata = self._get_module((stype, etype, dtype))(
+                    rel_graph,
+                    (inputs[stype], inputs[dtype]),
+                    *mod_args.get((stype, etype, dtype), ()),
+                    **mod_kwargs.get((stype, etype, dtype), {})
+                )
+                outputs[dtype].append(dstdata)
+        rsts = {}
+        for nty, alist in outputs.items():
+            if len(alist) != 0:
+                rsts[nty] = self.agg_fn(alist, nty)
+        return rsts

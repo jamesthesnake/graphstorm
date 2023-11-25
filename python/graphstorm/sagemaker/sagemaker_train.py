@@ -39,11 +39,12 @@ from .utils import (download_yaml_config,
                     barrier,
                     terminate_workers,
                     wait_for_exit,
+                    download_model,
                     upload_model_artifacts)
 
 def launch_train_task(task_type, num_gpus, graph_config,
     save_model_path, ip_list, yaml_path,
-    extra_args, state_q, custom_script):
+    extra_args, state_q, custom_script, restore_model_path=None):
     """ Launch SageMaker training task
 
     Parameters
@@ -68,6 +69,10 @@ def launch_train_task(task_type, num_gpus, graph_config,
         A queue used to return execution result (success or failure)
     custom_script: str
         Custom training script provided by a customer to run customer training logic.
+    restore_model_path: str
+        Path for the model to restore for model fine-tuning.
+        Default: None
+
     Return
     ------
     Thread: training task thread
@@ -77,7 +82,7 @@ def launch_train_task(task_type, num_gpus, graph_config,
     elif task_type == BUILTIN_TASK_NODE_CLASSIFICATION:
         cmd = "graphstorm.run.gs_node_classification"
     elif task_type == BUILTIN_TASK_NODE_REGRESSION:
-        cmd = "graphstorm.run.gs_node_classification"
+        cmd = "graphstorm.run.gs_node_regression"
     elif task_type == BUILTIN_TASK_EDGE_CLASSIFICATION:
         cmd = "graphstorm.run.gs_edge_classification"
     elif task_type == BUILTIN_TASK_EDGE_REGRESSION:
@@ -94,10 +99,15 @@ def launch_train_task(task_type, num_gpus, graph_config,
         "--part-config", f"{graph_config}",
         "--ip-config", f"{ip_list}",
         "--extra-envs", f"LD_LIBRARY_PATH={os.environ['LD_LIBRARY_PATH']} ",
-        "--ssh-port", "22"]
+        "--ssh-port", "22",
+        "--do-nid-remap", "False" # No need to do nid map in SageMaker trianing.
+        ]
     launch_cmd += [custom_script] if custom_script is not None else []
     launch_cmd += ["--cf", f"{yaml_path}",
-        "--save-model-path", f"{save_model_path}"] + extra_args
+        "--save-model-path", f"{save_model_path}"]
+    launch_cmd += ["--restore-model-path", f"{restore_model_path}"] \
+            if restore_model_path is not None else []
+    launch_cmd += extra_args
 
     print(launch_cmd)
 
@@ -145,6 +155,12 @@ def run_train(args, unknownargs):
     """
     num_gpus = args.num_gpus
     data_path = args.data_path
+    model_checkpoint_s3 = args.model_checkpoint_to_load
+    if model_checkpoint_s3 is not None:
+        restore_model_path = "/tmp/gsgnn_model_checkpoint/"
+        os.makedirs(restore_model_path, exist_ok=True)
+    else:
+        restore_model_path = None
     output_path = "/tmp/gsgnn_model/"
     os.makedirs(output_path, exist_ok=True)
 
@@ -212,7 +228,12 @@ def run_train(args, unknownargs):
     yaml_path = download_yaml_config(train_yaml_s3,
         data_path, sagemaker_session)
     graph_config_path = download_graph(graph_data_s3, graph_name,
-        host_rank, data_path, sagemaker_session)
+        host_rank, world_size, data_path, sagemaker_session)
+    if model_checkpoint_s3 is not None:
+        # Download Saved model checkpoint to resume
+        download_model(model_checkpoint_s3, restore_model_path, sagemaker_session)
+        print(f"{restore_model_path} {os.listdir(restore_model_path)}")
+
 
     err_code = 0
     if host_rank == 0:
@@ -236,7 +257,8 @@ def run_train(args, unknownargs):
                                             yaml_path,
                                             gs_params,
                                             state_q,
-                                            custom_script)
+                                            custom_script,
+                                            restore_model_path)
             train_task.join()
             err_code = state_q.get()
         except RuntimeError as e:

@@ -3,7 +3,7 @@
 Environment Setup
 ======================
 GraphStorm supports two environment setup methods:
-    - Install GraphStorm using as a pip packcage. This method works well for development and test on a signle machine.
+    - Install GraphStorm as a pip package. This method works well for development and test on a single machine.
     - Setup a GraphStorm Docker image. This method is good for using GraphStorm in distributed environments that commonly used in production.
 
 .. _setup_pip:
@@ -29,20 +29,20 @@ Users can use ``pip`` or ``pip3`` to install GraphStorm.
 
 Install Dependencies
 .....................
-Users should install PyTorch v1.13.1 and DGL v1.0.4 that is the core dependency of GraphStorm using the following commands.
+Users should install PyTorch v2.1.0 and DGL v1.0.4 that is the core dependency of GraphStorm using the following commands.
 
 For Nvidia GPU environment:
 
 .. code-block:: bash
 
-    pip install torch==1.13.1+cu116 --extra-index-url https://download.pytorch.org/whl/cu116
+    pip3 install torch==2.1.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
     pip install dgl==1.0.4+cu117 -f https://data.dgl.ai/wheels/cu117/repo.html
 
 For CPU environment:
 
 .. code-block:: bash
 
-    pip install torch==1.13.1+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+    pip3 install torch==2.1.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
     pip install dgl==1.0.4 -f https://data.dgl.ai/wheels-internal/repo.html
 
 Configure SSH No-password login
@@ -125,6 +125,8 @@ There are three arguments of the ``build_docker_oss4local.sh``:
 2. **docker-name** (optional), is the assigned name of the to be built Docker image. Default is ``graphstorm``.
 3. **docker-tag** (optional), is the assigned tag name of the to be built docker image. Default is ``local``.
 
+If Docker requires you to run it as a root user and you don't want to preface all docker commands with sudo, you can check the solution available `here <https://docs.docker.com/engine/install/linux-postinstall/#manage-docker-as-a-non-root-user>`_.
+
 You can use the below command to check if the new Docker image is created successfully.
 
 .. code:: bash
@@ -137,6 +139,10 @@ Create a GraphStorm Container
 ..............................
 
 First, you need to create a GraphStorm container based on the Docker image built in the previous step.
+
+.. note::
+
+    If you are preparing the environment to run GraphStorm in a distributed setting, specific instruction for running a Docker image with the NFS folder is given in :ref:`this section<distributed-cluster>`.
 
 Run the following command:
 

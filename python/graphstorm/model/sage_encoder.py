@@ -18,13 +18,50 @@
 from torch import nn
 import torch.nn.functional as F
 import dgl.nn as dglnn
+from dgl.distributed.constants import DEFAULT_NTYPE
 
 from .ngnn_mlp import NGNNMLP
 from .gnn_encoder_base import GraphConvEncoder
 
 
 class SAGEConv(nn.Module):
-    r"""GraphSage Convolutional layer.
+    r"""GraphSage Convolutional layerfrom `Inductive Representation Learning on
+    Large Graphs <https://arxiv.org/pdf/1706.02216.pdf>`__
+
+    .. math::
+        h_{\mathcal{N}(i)}^{(l+1)} &= \mathrm{aggregate}
+        \left(\{h_{j}^{l}, \forall j \in \mathcal{N}(i) \}\right)
+
+        h_{i}^{(l+1)} &= \sigma \left(W \cdot \mathrm{concat}
+        (h_{i}^{l}, h_{\mathcal{N}(i)}^{l+1}) \right)
+
+        h_{i}^{(l+1)} &= \mathrm{norm}(h_{i}^{(l+1)})
+
+    If a weight tensor on each edge is provided, the aggregation becomes:
+
+    .. math::
+        h_{\mathcal{N}(i)}^{(l+1)} = \mathrm{aggregate}
+        \left(\{e_{ji} h_{j}^{l}, \forall j \in \mathcal{N}(i) \}\right)
+
+    where :math:`e_{ji}` is the scalar weight on the edge from node :math:`j` to node :math:`i`.
+    Please make sure that :math:`e_{ji}` is broadcastable with :math:`h_j^{l}`.
+
+    Note:
+    -----
+    * SAGEConv is only effective on the homogeneous graph, not like other conv implementation.
+
+    Examples:
+    ----------
+
+    .. code:: python
+
+        # suppose graph and input_feature are ready
+        from graphstorm.model.sage_encoder import SAGEConv
+
+        layer = SAGEConv(h_dim, h_dim, aggregator_type,
+                                bias, activation, dropout,
+                                num_ffn_layers_in_gnn, norm)
+        h = layer(g, input_feature)
 
     Parameters
     ----------
@@ -88,16 +125,16 @@ class SAGEConv(nn.Module):
         ----------
         g : DGLHeteroGraph
             Input graph.
-        inputs : dict["_N", torch.Tensor]
+        inputs : dict[DEFAULT_NTYPE, torch.Tensor]
             Node feature for each node type.
         Returns
         -------
-        dict{"_N", torch.Tensor}
+        dict{DEFAULT_NTYPE, torch.Tensor}
             New node features for each node type.
         """
         g = g.local_var()
 
-        inputs = inputs['_N']
+        inputs = inputs[DEFAULT_NTYPE]
         h_conv = self.conv(g, inputs)
         if self.norm:
             h_conv = self.norm(h_conv)
@@ -106,11 +143,14 @@ class SAGEConv(nn.Module):
         if self.num_ffn_layers_in_gnn > 0:
             h_conv = self.ngnn_mlp(h_conv)
 
-        return {'_N': h_conv}
+        return {DEFAULT_NTYPE: h_conv}
 
 
 class SAGEEncoder(GraphConvEncoder):
     r""" GraphSage Conv Encoder
+
+    The SAGEEncoder employs several SAGEConv Layers as its encoding mechanism.
+    The SAGEEncoder should be designated as the model's encoder within Graphstorm.
 
     Parameters
     ----------
@@ -126,6 +166,38 @@ class SAGEEncoder(GraphConvEncoder):
         Number of ngnn gnn layers between GNN layers
     norm : str, optional
         Normalization Method. Default: None
+
+    Examples:
+    ----------
+
+    .. code:: python
+
+        # Build model and do full-graph inference on SAGEEncoder
+        from graphstorm import get_feat_size
+        from graphstorm.model.sage_encoder import SAGEEncoder
+        from graphstorm.model.node_decoder import EntityClassifier
+        from graphstorm.model import GSgnnNodeModel, GSNodeEncoderInputLayer
+        from graphstorm.dataloading import GSgnnNodeTrainData
+        from graphstorm.model import do_full_graph_inference
+
+        np_data = GSgnnNodeTrainData(...)
+
+        model = GSgnnNodeModel(alpha_l2norm=0)
+        feat_size = get_feat_size(np_data.g, 'feat')
+        encoder = GSNodeEncoderInputLayer(g, feat_size, 4,
+                                          dropout=0,
+                                          use_node_embeddings=True)
+        model.set_node_input_encoder(encoder)
+
+        gnn_encoder = SAGEEncoder(4, 4,
+                                  num_hidden_layers=1,
+                                  dropout=0,
+                                  aggregator_type='mean',
+                                  norm=norm)
+        model.set_gnn_encoder(gnn_encoder)
+        model.set_decoder(EntityClassifier(model.gnn_encoder.out_dims, 3, False))
+
+        h = do_full_graph_inference(model, np_data)
     """
     def __init__(self,
                  h_dim, out_dim,
@@ -157,7 +229,7 @@ class SAGEEncoder(GraphConvEncoder):
         ----------
         blocks: DGL MFGs
             Sampled subgraph in DGL MFG
-        h: dict["_N", torch.Tensor]
+        h: dict[DEFAULT_NTYPE, torch.Tensor]
             Input node feature for each node type.
         """
         for layer, block in zip(self.layers, blocks):
